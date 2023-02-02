@@ -1,0 +1,44 @@
+# syntax = docker/dockerfile:1.0-experimental
+
+FROM --platform=linux/amd64 ubuntu:20.04 as build
+
+ENV TZ=America/Denver
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+    	build-essential cmake lcov \ 
+        curl \
+        gcc \
+        g++ \
+        make \
+        cmake \
+        autoconf \
+        libtool \
+        git \
+        libssl-dev \
+        pkg-config \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rust.sh && sh -- rust.sh -y
+
+WORKDIR /volume
+
+COPY ./ ./
+
+RUN /root/.cargo/bin/cargo build
+
+
+FROM --platform=linux/amd64 ubuntu:20.04 as run
+
+ENV TZ=America/Denver
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+            libssl-dev \
+        pkg-config \
+        ca-certificates
+
+COPY --from=build /volume/target/debug/indy-vdr-proxy /

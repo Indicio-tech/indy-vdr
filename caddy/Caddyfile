@@ -1,0 +1,17 @@
+# Listen on all interfaces, default Caddy port
+{$SITE_ADDRESS} {
+
+	# Handle all other traffic.
+	handle {
+		reverse_proxy http://vdr-controller:4444
+	}
+
+	# What logs should look like.
+	log {
+			output stdout 
+			# format single_field common_log
+			level DEBUG
+	}
+
+	tls {$EMAIL_ADDRESS}
+}

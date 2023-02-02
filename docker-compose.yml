@@ -1,0 +1,46 @@
+version: '3'
+
+networks:
+  vdr-network:
+
+services:
+  caddy:
+    image: caddy
+    hostname: caddy
+    restart: unless-stopped
+    environment:
+      - SITE_ADDRESS=${SITE_ADDRESS:-:80}
+      - EMAIL_ADDRESS=${EMAIL_ADDRESS:-internal}
+    networks:
+      - vdr-network
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+    healthcheck:
+      # Port 2019 is an internal Caddy admin port.
+      test: nc -zv localhost:2019 || exit -1
+      interval: 3s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    ports: # Uncomment to access caddy outside of containers
+      - 80:80
+      - 443:443
+
+
+  vdr-controller:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.vdrproxy
+      target: run
+    restart: unless-stopped
+    networks:
+      - vdr-network
+    working_dir: /
+    entrypoint: /bin/bash
+    command: ["-c", "./indy-vdr-proxy -g https://raw.githubusercontent.com/Indicio-tech/indicio-network/main/genesis_files/pool_transactions_testnet_genesis -p 4444"]
+#    healthcheck:
+#      test: /bin/bash -c "</dev/tcp/vdr-controller/3010"
+#      interval: 5s
+#      timeout: 5s
+#      retries: 5
+
