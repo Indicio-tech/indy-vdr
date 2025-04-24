@@ -11,9 +11,8 @@ license = "Apache-2.0"
 
 [features]
 fetch = ["hyper/client", "hyper-tls"]
-zmq_vendored = ["indy-vdr/zmq_vendored"]
 tls = ["rustls-pemfile", "tokio-rustls", "hyper/stream"]
-default = ["fetch", "zmq_vendored"]
+default = ["fetch"]
 
 [dependencies]
 clap = "~4.2"

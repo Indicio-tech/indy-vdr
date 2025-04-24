@@ -21,15 +21,11 @@ crate-type = ["staticlib", "rlib", "cdylib"]
 [features]
 ffi = ["ffi-support", "logger"]
 logger = ["env_logger", "log"]
-zmq_vendored = ["zmq/vendored"]
 local_nodes_pool = []
 rich_schema = ["indy-data-types/rich_schema"]
-default = ["ffi", "log", "zmq_vendored"]
+default = ["ffi", "log"]
 
 [dependencies]
-# This is added so we can lock the version that zmq uses
-# 0.1.49 is broken for ios targets
-cmake = { version = "=0.1.48", optional = true }
 base64 = "0.22"
 bs58 = "0.5"
 etcommon-rlp = "0.2.4"
@@ -59,7 +55,7 @@ sha3 = "0.10"
 thiserror = "1.0"
 time = { version = "0.3.36", features = ["parsing"] }
 url = "2.2.2"
-zmq = "0.9"
+zmq = { git = "https://github.com/conanoc/rust-zmq", tag = "v0.10.0.1", features = ["libsodium"] }
 sled = "0.34.7"
 
 [dev-dependencies]
