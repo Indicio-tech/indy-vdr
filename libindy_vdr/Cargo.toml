@@ -23,6 +23,7 @@ ffi = ["ffi-support", "logger"]
 logger = ["env_logger", "log"]
 local_nodes_pool = []
 rich_schema = ["indy-data-types/rich_schema"]
+libsodium = ["zmq/libsodium"]
 default = ["ffi", "log"]
 
 [dependencies]
@@ -55,8 +56,8 @@ sha3 = "0.10"
 thiserror = "1.0"
 time = { version = "0.3.36", features = ["parsing"] }
 url = "2.2.2"
-zmq = { git = "https://github.com/conanoc/rust-zmq", tag = "v0.10.0.1", features = ["libsodium"] }
 sled = "0.34.7"
+zmq = {branch = "fix/libSodium", git = "https://github.com/Indicio-tech/rust-zmq"}
 
 [dev-dependencies]
 rstest = "0.25"
