@@ -57,7 +57,7 @@ thiserror = "1.0"
 time = { version = "0.3.36", features = ["parsing"] }
 url = "2.2.2"
 sled = "0.34.7"
-zmq = {branch = "fix/libSodium", git = "https://github.com/Indicio-tech/rust-zmq"}
+zmq = {rev = "54fd199", git = "https://github.com/Indicio-tech/rust-zmq"}
 
 [dev-dependencies]
 rstest = "0.25"
