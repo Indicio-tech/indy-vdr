@@ -35,9 +35,11 @@ services:
     restart: unless-stopped
     networks:
       - vdr-network
-    working_dir: /
+    working_dir: /   
+    volumes:
+      - ./ledgers:/ledgers
     entrypoint: /bin/bash
-    command: ["-c", "./indy-vdr-proxy -g https://raw.githubusercontent.com/Indicio-tech/indicio-network/main/genesis_files/pool_transactions_testnet_genesis -p 4444"]
+    command: ["-c", "./indy-vdr-proxy -g /ledgers -p 4444 --multiple-ledgers"]
 #    healthcheck:
 #      test: /bin/bash -c "</dev/tcp/vdr-controller/3010"
 #      interval: 5s

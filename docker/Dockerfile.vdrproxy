@@ -1,6 +1,6 @@
 # syntax = docker/dockerfile:1.0-experimental
 
-FROM --platform=linux/amd64 ubuntu:20.04 as build
+FROM --platform=linux/amd64 ubuntu:24.04 as build
 
 ENV TZ=America/Denver
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -22,6 +22,7 @@ RUN apt-get update -y && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rust.sh && sh -- rust.sh -y
+RUN /root/.cargo/bin/rustup default 1.82.0
 
 WORKDIR /volume
 
@@ -30,7 +31,7 @@ COPY ./ ./
 RUN /root/.cargo/bin/cargo build
 
 
-FROM --platform=linux/amd64 ubuntu:20.04 as run
+FROM --platform=linux/amd64 ubuntu:24.04 as run
 
 ENV TZ=America/Denver
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
