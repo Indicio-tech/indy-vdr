@@ -1,6 +1,7 @@
 """Module setup."""
 
 import runpy
+
 from setuptools import find_packages, setup
 
 PACKAGE_NAME = "indy_vdr"
@@ -11,8 +12,8 @@ if __name__ == "__main__":
     setup(
         name=PACKAGE_NAME,
         version=VERSION,
-        author="Hyperledger Aries Contributors",
-        author_email="aries@lists.hyperledger.org",
+        author="Hyperledger Indy Contributors",
+        author_email="indy@lists.hyperledger.org",
         url="https://github.com/hyperledger/indy-vdr",
         packages=find_packages(),
         include_package_data=True,

@@ -1,3 +1,13 @@
+import type { PrepareTxnAuthorAgreementAcceptanceOptions } from './builderTypes'
+import type {
+  PoolHandle,
+  PoolStatus,
+  PoolSubmitActionOptions,
+  PoolSubmitRequestOptions,
+  RequestHandle,
+  Transactions,
+  Verifiers,
+} from './types'
 import type {
   AcceptanceMechanismsRequestOptions,
   AttribRequestOptions,
@@ -23,15 +33,11 @@ import type {
   TransactionAuthorAgreementRequestOptions,
 } from '../builder'
 import type {
-  PoolHandle,
-  RequestHandle,
   RequestSetEndorserOptions,
   RequestSetMultiSignatureOptions,
   RequestSetSignatureOptions,
   RequestSetTxnAuthorAgreementAcceptanceOptions,
 } from '../indyVdr'
-import type { PrepareTxnAuthorAgreementAcceptanceOptions } from './builderTypes'
-import type { PoolStatus, PoolSubmitActionOptions, PoolSubmitRequestOptions, Transactions, Verifiers } from './types'
 
 // TODO: proper documentation
 export interface IndyVdr {
@@ -40,6 +46,10 @@ export interface IndyVdr {
   version(): string
 
   setConfig(options: { config: Record<string, unknown> }): void
+
+  setCacheDirectory(options: { path: string }): void
+
+  setLedgerTxnCache(options: { capacity: number; expiry_offset_ms: number; path?: string }): void
 
   setDefaultLogger(): void
 
@@ -109,7 +119,7 @@ export interface IndyVdr {
 
   requestFree(options: { requestHandle: number }): void
 
-  requestGetBody<T extends Record<string, unknown>>(options: { requestHandle: number }): T
+  requestGetBody(options: { requestHandle: number }): string
 
   requestGetSignatureInput(options: { requestHandle: number }): string
 

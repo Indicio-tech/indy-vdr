@@ -3,7 +3,7 @@
 #include <fbjni/fbjni.h>
 #include <ReactCommon/CallInvokerHolder.h>
 
-#include <turboModuleUtility.h>
+#include "turboModuleUtility.h"
 
 using namespace facebook;
 
@@ -25,7 +25,7 @@ private:
     auto runtime = reinterpret_cast<jsi::Runtime*>(jsiRuntimePointer);
     auto jsCallInvoker = jsCallInvokerHolder->cthis()->getCallInvoker();
 
-    turboModuleUtility::registerTurboModule(*runtime, jsCallInvoker);
+    indyVdrTurboModuleUtility::registerTurboModule(*runtime, jsCallInvoker);
   }
 };
 

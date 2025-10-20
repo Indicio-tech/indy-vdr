@@ -1,10 +1,10 @@
-#import "turboModuleUtility.h"
-
-#import "IndyVdr.h"
 #import <React/RCTBridge+Private.h>
 #import <jsi/jsi.h>
 #import <React/RCTUtils.h>
 #import <ReactCommon/RCTTurboModule.h>
+
+#import "turboModuleUtility.h"
+#import "IndyVdr.h"
 
 using namespace facebook;
 
@@ -26,7 +26,7 @@ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install)
     }
 
     auto callInvoker = bridge.jsCallInvoker;
-    turboModuleUtility::registerTurboModule(*jsiRuntime, callInvoker);
+    indyVdrTurboModuleUtility::registerTurboModule(*jsiRuntime, callInvoker);
     return @true;
 }
 

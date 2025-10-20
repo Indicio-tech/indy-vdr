@@ -14,6 +14,7 @@
 //!
 //! ```no_run
 //! use futures_executor::block_on;
+//! use indy_vdr::config::PoolConfig;
 //! use indy_vdr::pool::{
 //!     helpers::perform_get_txn,
 //!     PoolBuilder,
@@ -25,14 +26,14 @@
 //! let txns = PoolTransactions::from_json_file("./genesis.txn").unwrap();
 //!
 //! // Create a PoolBuilder instance
-//! let pool_builder = PoolBuilder::default().transactions(txns).unwrap();
+//! let pool_builder = PoolBuilder::new(PoolConfig::default(), txns);
 //! // Convert into a thread-local Pool instance
 //! let pool = pool_builder.into_local().unwrap();
 //!
 //! // Create a new GET_TXN request and dispatch it
 //! let ledger_type = 1;  // 1 identifies the Domain ledger, see pool::LedgerType
 //! let seq_no = 1;       // Transaction sequence number
-//! let (result, _timing) = block_on(perform_get_txn(&pool, ledger_type, seq_no)).unwrap();
+//! let (result, _meta) = block_on(perform_get_txn(&pool, ledger_type, seq_no, None)).unwrap();
 
 #![cfg_attr(feature = "fatal_warnings", deny(warnings))]
 #![recursion_limit = "1024"] // for select! macro usage
@@ -48,7 +49,7 @@ extern crate serde;
 extern crate serde_json;
 
 #[macro_use]
-extern crate indy_utils;
+extern crate indy_data_types;
 
 /// Utility functions, traits and macros
 #[macro_use]
@@ -66,6 +67,9 @@ mod ffi;
 pub mod ledger;
 /// Handling of verifier pool instances and communication
 pub mod pool;
+
+/// did:indy DID URL resolver
+pub mod resolver;
 /// State proof verification for ledger read transactions
 pub mod state_proof;
 

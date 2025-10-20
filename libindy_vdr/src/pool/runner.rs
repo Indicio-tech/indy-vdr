@@ -7,11 +7,13 @@ use futures_executor::block_on;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::{select, FutureExt};
 
+use super::cache::Cache;
 use super::helpers::{perform_ledger_request, perform_refresh};
 use super::networker::{Networker, NetworkerFactory};
 use super::requests::PreparedRequest;
-use super::types::{RequestResult, TimingResult, Verifiers};
-use super::{LocalPool, Pool};
+use super::types::{RequestResult, RequestResultMeta, Verifiers};
+use super::{LocalPool, Pool, PoolTransactions};
+
 use crate::common::error::prelude::*;
 use crate::common::merkle_tree::MerkleTree;
 use crate::config::PoolConfig;
@@ -32,6 +34,8 @@ impl PoolRunner {
         merkle_tree: MerkleTree,
         networker_factory: F,
         node_weights: Option<HashMap<String, f32>>,
+        refreshed: bool,
+        cache: Option<Cache<String, (String, RequestResultMeta)>>,
     ) -> Self
     where
         F: NetworkerFactory<Output = Rc<dyn Networker>> + Send + 'static,
@@ -39,10 +43,15 @@ impl PoolRunner {
         let (sender, receiver) = unbounded();
         let worker = thread::spawn(move || {
             // FIXME handle error on build
-            let pool =
-                LocalPool::build(config.clone(), merkle_tree, networker_factory, node_weights)
-                    .unwrap();
-            let mut thread = PoolThread::new(pool, receiver);
+            let pool = LocalPool::build(
+                config.clone(),
+                merkle_tree,
+                networker_factory,
+                node_weights,
+                refreshed,
+            )
+            .unwrap();
+            let mut thread = PoolThread::new(pool, receiver, cache);
             thread.run();
             debug!("Pool thread ended")
         });
@@ -118,9 +127,9 @@ type GetTxnsResponse = VdrResult<Vec<String>>;
 
 type GetVerifiersResponse = VdrResult<Verifiers>;
 
-type RefreshResponse = VdrResult<(Vec<String>, Option<Vec<String>>, Option<TimingResult>)>;
+type RefreshResponse = VdrResult<(Option<PoolTransactions>, RequestResultMeta)>;
 
-type SendReqResponse = VdrResult<(RequestResult<String>, Option<TimingResult>)>;
+type SendReqResponse = VdrResult<(RequestResult<String>, RequestResultMeta)>;
 
 enum PoolEvent {
     GetStatus(Callback<GetStatusResponse>),
@@ -152,11 +161,20 @@ impl PoolRunnerStatus {
 struct PoolThread {
     pool: LocalPool,
     receiver: UnboundedReceiver<PoolEvent>,
+    cache: Option<Cache<String, (String, RequestResultMeta)>>,
 }
 
 impl PoolThread {
-    fn new(pool: LocalPool, receiver: UnboundedReceiver<PoolEvent>) -> Self {
-        Self { pool, receiver }
+    fn new(
+        pool: LocalPool,
+        receiver: UnboundedReceiver<PoolEvent>,
+        cache: Option<Cache<String, (String, RequestResultMeta)>>,
+    ) -> Self {
+        Self {
+            pool,
+            receiver,
+            cache,
+        }
     }
 
     fn run(&mut self) {
@@ -167,6 +185,7 @@ impl PoolThread {
         let mut futures = FuturesUnordered::new();
         let receiver = &mut self.receiver;
         loop {
+            let cache_ledger_request = self.cache.clone();
             select! {
                 recv_evt = receiver.next() => {
                     match recv_evt {
@@ -180,7 +199,7 @@ impl PoolThread {
                             callback(Ok(status));
                         }
                         Some(PoolEvent::GetTransactions(callback)) => {
-                            let txns = self.pool.get_json_transactions();
+                            let txns = self.pool.get_transactions().encode_json();
                             callback(txns);
                         }
                         Some(PoolEvent::GetVerifiers(callback)) => {
@@ -192,7 +211,7 @@ impl PoolThread {
                             futures.push(fut.boxed_local());
                         }
                         Some(PoolEvent::SendRequest(request, callback)) => {
-                            let fut = _perform_ledger_request(&self.pool, request, callback);
+                            let fut = _perform_ledger_request(&self.pool, request, callback, cache_ledger_request);
                             futures.push(fut.boxed_local());
                         }
                         None => { trace!("Pool runner sender dropped") }
@@ -211,15 +230,7 @@ impl PoolThread {
 }
 
 async fn _perform_refresh(pool: &LocalPool, callback: Callback<RefreshResponse>) {
-    let result = {
-        match perform_refresh(pool).await {
-            Ok((new_txns, timing)) => match pool.get_json_transactions() {
-                Ok(old_txns) => Ok((old_txns, new_txns, timing)),
-                Err(err) => Err(err),
-            },
-            Err(err) => Err(err),
-        }
-    };
+    let result = perform_refresh(pool).await;
     callback(result);
 }
 
@@ -227,7 +238,8 @@ async fn _perform_ledger_request(
     pool: &LocalPool,
     request: PreparedRequest,
     callback: Callback<SendReqResponse>,
+    cache: Option<Cache<String, (String, RequestResultMeta)>>,
 ) {
-    let result = perform_ledger_request(pool, &request).await;
+    let result = perform_ledger_request(pool, &request, cache).await;
     callback(result);
 }

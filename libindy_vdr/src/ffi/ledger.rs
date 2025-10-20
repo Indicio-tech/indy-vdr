@@ -1,4 +1,7 @@
+use std::str::FromStr;
+
 use crate::common::error::prelude::*;
+use crate::ledger::constants::UpdateRole;
 #[cfg(any(feature = "rich_schema", test))]
 use crate::ledger::identifiers::RichSchemaId;
 use crate::ledger::identifiers::{CredentialDefinitionId, RevocationRegistryId, SchemaId};
@@ -6,6 +9,7 @@ use crate::ledger::requests::auth_rule::{AuthRules, Constraint};
 use crate::ledger::requests::author_agreement::{AcceptanceMechanisms, GetTxnAuthorAgreementData};
 use crate::ledger::requests::cred_def::CredentialDefinition;
 use crate::ledger::requests::node::NodeOperationData;
+use crate::ledger::requests::pool::Schedule;
 use crate::ledger::requests::rev_reg::RevocationRegistryDelta;
 use crate::ledger::requests::rev_reg_def::{RegistryType, RevocationRegistryDefinition};
 #[cfg(any(feature = "rich_schema", test))]
@@ -109,9 +113,11 @@ pub extern "C" fn indy_vdr_build_attrib_request(
 pub extern "C" fn indy_vdr_build_get_attrib_request(
     submitter_did: FfiStr, // optional
     target_did: FfiStr,
-    raw: FfiStr,  // optional
-    hash: FfiStr, // optional
-    enc: FfiStr,  // optional
+    raw: FfiStr,    // optional
+    hash: FfiStr,   // optional
+    enc: FfiStr,    // optional
+    seq_no: i32,    // optional, -1 for None
+    timestamp: i64, // optional, -1 for None
     handle_p: *mut RequestHandle,
 ) -> ErrorCode {
     catch_err! {
@@ -126,7 +132,9 @@ pub extern "C" fn indy_vdr_build_get_attrib_request(
         let raw = raw.into_opt_string();
         let hash = hash.into_opt_string();
         let enc = enc.into_opt_string();
-        let req = builder.build_get_attrib_request(identifier.as_ref(), &dest, raw, hash, enc)?;
+        let seq_no = if seq_no == -1 { None } else { Some(seq_no) };
+        let timestamp = if timestamp == -1 { None } else { Some(timestamp as u64) };
+        let req = builder.build_get_attrib_request(identifier.as_ref(), &dest, raw, hash, enc, seq_no, timestamp)?;
         let handle = add_request(req)?;
         unsafe {
             *handle_p = handle;
@@ -218,6 +226,8 @@ pub extern "C" fn indy_vdr_build_get_cred_def_request(
 pub extern "C" fn indy_vdr_build_get_nym_request(
     submitter_did: FfiStr, // optional
     dest: FfiStr,
+    seq_no: i32,    // optional, -1 for None
+    timestamp: i64, // optional, -1 for None
     handle_p: *mut RequestHandle,
 ) -> ErrorCode {
     catch_err! {
@@ -226,7 +236,9 @@ pub extern "C" fn indy_vdr_build_get_nym_request(
         let builder = get_request_builder()?;
         let identifier = submitter_did.as_opt_str().map(DidValue::from_str).transpose()?;
         let dest = DidValue::from_str(dest.as_str())?;
-        let req = builder.build_get_nym_request(identifier.as_ref(), &dest)?;
+        let seq_no = if seq_no == -1 { None } else { Some(seq_no) };
+        let timestamp = if timestamp == -1 { None } else { Some(timestamp as u64) };
+        let req = builder.build_get_nym_request(identifier.as_ref(), &dest, seq_no, timestamp)?;
         let handle = add_request(req)?;
         unsafe {
             *handle_p = handle;
@@ -395,9 +407,11 @@ pub extern "C" fn indy_vdr_build_get_validator_info_request(
 pub extern "C" fn indy_vdr_build_nym_request(
     submitter_did: FfiStr,
     dest: FfiStr,
-    verkey: FfiStr, // optional
-    alias: FfiStr,  // optional
-    role: FfiStr,   // optional
+    verkey: FfiStr,         // optional
+    alias: FfiStr,          // optional
+    role: FfiStr,           // optional
+    diddoc_content: FfiStr, // optional
+    version: i32,           // optional, -1 for none
     handle_p: *mut RequestHandle,
 ) -> ErrorCode {
     catch_err! {
@@ -408,8 +422,10 @@ pub extern "C" fn indy_vdr_build_nym_request(
         let dest = DidValue::from_str(dest.as_str())?;
         let verkey = verkey.into_opt_string();
         let alias = alias.into_opt_string();
-        let role = role.into_opt_string();
-        let req = builder.build_nym_request(&identifier, &dest, verkey, alias, role)?;
+        let role = role.as_opt_str().map(UpdateRole::from_str).transpose()?;
+        let diddoc_content = diddoc_content.as_opt_str().map(serde_json::from_str).transpose().with_input_err("Error deserializing raw value as JSON")?;
+        let version = if version == -1 { None } else { Some(version) };
+        let req = builder.build_nym_request(&identifier, &dest, verkey, alias, role, diddoc_content.as_ref(), version)?;
         let handle = add_request(req)?;
         unsafe {
             *handle_p = handle;
@@ -665,6 +681,50 @@ pub extern "C" fn indy_vdr_build_pool_restart_request(
         let action = action.as_str();
         let datetime = datetime.into_opt_string();
         let req = builder.build_pool_restart_request(&identifier, action, datetime.as_deref())?;
+        let handle = add_request(req)?;
+        unsafe {
+            *handle_p = handle;
+        }
+        Ok(ErrorCode::Success)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn indy_vdr_build_pool_upgrade_request(
+    identifier: FfiStr,
+    name: FfiStr,
+    version: FfiStr,
+    action: FfiStr,
+    sha256: FfiStr,
+    timeout: i32,
+    schedule: FfiStr,
+    justification: FfiStr,
+    reinstall: i8,
+    force: i8,
+    package: FfiStr,
+    handle_p: *mut RequestHandle,
+) -> ErrorCode {
+    catch_err! {
+        trace!("Build POOL_UPGRADE request");
+        check_useful_c_ptr!(handle_p);
+        let builder = get_request_builder()?;
+        let identifier = DidValue::from_str(identifier.as_str())?;
+        let name = name.as_str();
+        let version = version.as_str();
+        let action = action.as_str();
+        let sha256 = sha256.as_str();
+        let timeout = if timeout == -1 { None } else { Some(timeout as u32) };
+        let schedule = match schedule.as_opt_str() {
+            Some(s) => {
+                let schedule: Schedule = serde_json::from_str(s).with_input_err("Error deserializing Schedule value as JSON")?;
+                Some(schedule)
+            }
+            None => None,
+        };
+        let justification = justification.into_opt_string();
+        let package = package.into_opt_string();
+        let req = builder.build_pool_upgrade_request(&identifier, name, version, action, sha256, timeout, schedule,
+            justification.as_deref(), reinstall != 0, force != 0, package.as_deref())?;
         let handle = add_request(req)?;
         unsafe {
             *handle_p = handle;

@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
 use futures_util::stream::StreamExt;
 
 use crate::common::error::prelude::*;
@@ -7,15 +10,15 @@ use crate::utils::base58;
 use super::types::Message;
 use super::{
     check_cons_proofs, min_consensus, ConsensusState, PoolRequest, ReplyState, RequestEvent,
-    RequestResult, TimingResult,
+    RequestResult, RequestResultMeta,
 };
 
-pub type CatchupTarget = (Vec<u8>, usize);
+pub type CatchupTarget = (Vec<u8>, usize, Vec<String>);
 
 pub async fn handle_status_request<R: PoolRequest>(
     request: &mut R,
-    merkle_tree: MerkleTree,
-) -> VdrResult<(RequestResult<Option<CatchupTarget>>, Option<TimingResult>)> {
+    merkle_tree: &MerkleTree,
+) -> VdrResult<(RequestResult<Option<CatchupTarget>>, RequestResultMeta)> {
     trace!("status request");
     let config = request.pool_config();
     let total_node_count = request.node_count();
@@ -60,43 +63,37 @@ pub async fn handle_status_request<R: PoolRequest>(
                         VdrErrorKind::PoolTimeout,
                         "Request was interrupted",
                     )),
-                    request.get_timing(),
+                    request.get_meta(),
                 ))
             }
         };
         match check_nodes_responses_on_status(
-            &merkle_tree,
+            merkle_tree,
             &replies,
             &consensus,
             total_node_count,
             f,
         ) {
             Ok(CatchupProgress::NotNeeded) => {
-                return Ok((RequestResult::Reply(None), request.get_timing()));
+                return Ok((RequestResult::Reply(None), request.get_meta()));
             }
             Ok(CatchupProgress::InProgress) => {}
             Ok(CatchupProgress::NoConsensus) => {
                 return Ok((
                     RequestResult::Failed(replies.get_error()),
-                    request.get_timing(),
+                    request.get_meta(),
                 ));
             }
-            Ok(CatchupProgress::ShouldBeStarted(target_mt_root, target_mt_size)) => {
-                return Ok((
-                    RequestResult::Reply(Some((target_mt_root, target_mt_size))),
-                    request.get_timing(),
-                ));
+            Ok(CatchupProgress::ShouldBeStarted(target)) => {
+                return Ok((RequestResult::Reply(Some(target)), request.get_meta()));
             }
-            Err(err) => return Ok((RequestResult::Failed(err), request.get_timing())),
+            Err(err) => return Ok((RequestResult::Failed(err), request.get_meta())),
         };
     }
 }
 
 enum CatchupProgress {
-    ShouldBeStarted(
-        Vec<u8>, //target_mt_root
-        usize,   //target_mt_size
-    ),
+    ShouldBeStarted(CatchupTarget),
     NoConsensus,
     NotNeeded,
     InProgress,
@@ -109,9 +106,10 @@ fn check_nodes_responses_on_status<R>(
     total_nodes_count: usize,
     f: usize,
 ) -> VdrResult<CatchupProgress> {
-    let max_consensus = if let Some((most_popular_vote, votes_count)) = consensus.max_entry() {
+    let max_consensus = if let Some((most_popular_vote, votes)) = consensus.max_entry() {
+        let votes_count = votes.len();
         if votes_count > f {
-            return try_to_catch_up(most_popular_vote, merkle_tree);
+            return try_to_catch_up(most_popular_vote, merkle_tree, votes);
         }
         votes_count
     } else {
@@ -126,35 +124,39 @@ fn check_nodes_responses_on_status<R>(
 fn try_to_catch_up(
     ledger_status: &(String, usize, Option<Vec<String>>),
     merkle_tree: &MerkleTree,
+    nodes: &HashSet<String>,
 ) -> VdrResult<CatchupProgress> {
-    let &(ref target_mt_root, target_mt_size, ref hashes) = ledger_status;
+    let (target_mt_root, target_mt_size, hashes) = ledger_status;
     let cur_mt_size = merkle_tree.count();
     let cur_mt_hash = base58::encode(merkle_tree.root_hash());
 
-    if target_mt_size == cur_mt_size {
-        if cur_mt_hash.eq(target_mt_root) {
-            Ok(CatchupProgress::NotNeeded)
-        } else {
-            Err(input_err(
-                "Ledger merkle tree is not acceptable for current tree.",
-            ))
-        }
-    } else if target_mt_size > cur_mt_size {
-        let target_mt_root = base58::decode(target_mt_root)
-            .with_input_err("Can't parse target MerkleTree hash from nodes responses")?;
-
-        match *hashes {
-            None => (),
-            Some(ref hashes) => {
-                check_cons_proofs(merkle_tree, hashes, &target_mt_root, target_mt_size)?
+    match target_mt_size.cmp(&cur_mt_size) {
+        Ordering::Equal => {
+            if cur_mt_hash.eq(target_mt_root) {
+                Ok(CatchupProgress::NotNeeded)
+            } else {
+                Err(input_err(
+                    "Ledger merkle tree is not acceptable for current tree.",
+                ))
             }
-        };
+        }
+        Ordering::Greater => {
+            let target_mt_root = base58::decode(target_mt_root)
+                .with_input_err("Can't parse target MerkleTree hash from nodes responses")?;
 
-        Ok(CatchupProgress::ShouldBeStarted(
-            target_mt_root,
-            target_mt_size,
-        ))
-    } else {
-        Err(input_err("Local merkle tree greater than mt from ledger"))
+            match hashes {
+                None => (),
+                Some(ref hashes) => {
+                    check_cons_proofs(merkle_tree, hashes, &target_mt_root, *target_mt_size)?
+                }
+            };
+
+            Ok(CatchupProgress::ShouldBeStarted((
+                target_mt_root,
+                *target_mt_size,
+                nodes.iter().cloned().collect(),
+            )))
+        }
+        _ => Err(input_err("Local merkle tree greater than mt from ledger")),
     }
 }

@@ -27,8 +27,8 @@ pub enum VdrErrorKind {
     Config,
     #[error("Connection error")]
     Connection,
-    #[error("File system error: {0}")]
-    FileSystem(std::io::Error),
+    #[error("File system error")]
+    FileSystem,
     #[error("Input error")]
     Input,
     #[error("Resource error")]
@@ -46,6 +46,8 @@ pub enum VdrErrorKind {
     PoolRequestFailed(String),
     #[error("Pool timeout")]
     PoolTimeout,
+    #[error("Resolver error")]
+    Resolver,
 }
 
 impl VdrError {
@@ -66,6 +68,14 @@ impl VdrError {
             VdrErrorKind::PoolRequestFailed(ref response) => Some(response.clone()),
             _ => None,
         }
+    }
+
+    pub fn with_source<E>(mut self, source: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.source.replace(source.into());
+        self
     }
 }
 
@@ -108,9 +118,21 @@ impl From<crate::utils::ValidationError> for VdrError {
     }
 }
 
+impl From<std::io::Error> for VdrError {
+    fn from(err: std::io::Error) -> VdrError {
+        VdrError::new(VdrErrorKind::FileSystem, None, Some(Box::new(err)))
+    }
+}
+
 impl From<zmq::Error> for VdrError {
     fn from(err: zmq::Error) -> VdrError {
         VdrError::new(VdrErrorKind::Connection, None, Some(Box::new(err)))
+    }
+}
+
+impl From<sled::Error> for VdrError {
+    fn from(err: sled::Error) -> VdrError {
+        VdrError::new(VdrErrorKind::FileSystem, None, Some(Box::new(err)))
     }
 }
 

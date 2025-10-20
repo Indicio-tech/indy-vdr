@@ -7,18 +7,16 @@ pub(crate) mod types;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use indy_blssignatures::{Bls, Generator, MultiSignature, VerKey};
+use indy_data_types::merkle_tree::{MerkleTree, Positioned};
 use rlp::UntrustedRlp;
 use serde_json::Value as SJsonValue;
-use ursa::bls::{Bls, Generator, MultiSignature, VerKey};
+use sha2::{Digest, Sha256};
 
 use crate::common::error::prelude::*;
-use crate::pool::{ProtocolVersion, VerifierKeys};
+use crate::pool::{ProtocolVersion, StateProofAssertions, StateProofResult, VerifierKeys};
 use crate::utils::base58;
 use crate::utils::base64;
-use crate::utils::hash::{
-    TreeHash,
-    SHA256::{self, DigestType as Sha256},
-};
 
 use self::constants::{
     REQUESTS_FOR_MULTI_STATE_PROOFS, REQUESTS_FOR_STATE_PROOFS,
@@ -81,6 +79,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_state_proof(
     msg_result: &SJsonValue,
     f: usize,
@@ -92,7 +91,7 @@ pub(crate) fn check_state_proof(
     last_write_time: u64,
     threshold: u64,
     custom_state_proof_parser: Option<&BoxedSPParser>,
-) -> bool {
+) -> StateProofResult {
     trace!("process_reply: Try to verify proof and signature >>");
 
     let res = match parse_generic_reply_for_proof_checking(
@@ -103,26 +102,26 @@ pub(crate) fn check_state_proof(
     ) {
         Some(parsed_sps) => {
             trace!("process_reply: Proof and signature are present");
-            if verify_parsed_sp(parsed_sps, bls_keys, f, gen) {
-                if check_freshness(msg_result, requested_timestamps, last_write_time, threshold) {
-                    true
-                } else {
-                    debug!("Freshness check failed");
-                    false
+            match verify_parsed_sp(parsed_sps, bls_keys, f, gen) {
+                Ok((asserts, None)) => {
+                    if check_freshness(msg_result, requested_timestamps, last_write_time, threshold)
+                    {
+                        StateProofResult::Verified(asserts)
+                    } else {
+                        StateProofResult::Expired(asserts)
+                    }
                 }
-            } else {
-                debug!("Verification of parsed state proof failed");
-                false
+                Ok((asserts, Some(verify_err))) => {
+                    StateProofResult::Invalid(verify_err, Some(asserts))
+                }
+                Err(err) => StateProofResult::Invalid(err, None),
             }
         }
-        None => {
-            debug!("No state proof found");
-            false
-        }
+        None => StateProofResult::Missing,
     };
 
     trace!(
-        "process_reply: Try to verify proof and signature << {}",
+        "process_reply: Try to verify proof and signature << {:?}",
         res
     );
     res
@@ -283,7 +282,9 @@ pub(crate) fn verify_parsed_sp(
     nodes: &VerifierKeys,
     f: usize,
     gen: &Generator,
-) -> bool {
+) -> Result<(StateProofAssertions, Option<String>), String> {
+    let mut multi_sig: Option<SJsonValue> = None;
+
     for parsed_sp in parsed_sps {
         if parsed_sp.multi_signature["value"]["state_root_hash"]
             .as_str()
@@ -292,48 +293,40 @@ pub(crate) fn verify_parsed_sp(
                 .as_str()
                 .ne(&Some(&parsed_sp.root_hash))
         {
-            debug!("Given signature is not for current root hash, aborting");
-            return false;
+            return Err("Given signature does not match state proof, aborting verification".into());
         }
 
-        let (signature, participants, value) = unwrap_opt_or_return!(
-            _parse_reply_for_proof_signature_checking(&parsed_sp.multi_signature),
-            {
-                debug!("Reply parsing failed");
-                false
+        match multi_sig.as_ref() {
+            Some(sig) => {
+                if sig != &parsed_sp.multi_signature {
+                    return Err("No consistency between proof multi signatures".into());
+                }
             }
-        );
-        if !_verify_proof_signature(signature, participants.as_slice(), &value, nodes, f, gen)
-            .map_err(|err| debug!("Proof signature verification failed: {}", err))
-            .unwrap_or(false)
-        {
-            return false;
+            None => {
+                multi_sig.replace(parsed_sp.multi_signature);
+            }
         }
 
-        let proof_nodes = unwrap_or_return!(base64::decode(&parsed_sp.proof_nodes), {
-            debug!("Error decoding proof nodes from state proof");
-            false
-        });
-        let root_hash = unwrap_or_return!(base58::decode(parsed_sp.root_hash), {
-            debug!("Error decoding root hash from state proof");
-            false
-        });
+        let Ok(proof_nodes) = base64::decode(&parsed_sp.proof_nodes) else {
+            return Err("Error decoding proof nodes from state proof".into());
+        };
+        let Ok(root_hash) = base58::decode(parsed_sp.root_hash) else {
+            return Err("Error decoding root hash from state proof".into());
+        };
         match parsed_sp.kvs_to_verify {
             KeyValuesInSP::Simple(kvs) => match kvs.verification_type {
                 KeyValueSimpleDataVerificationType::Simple => {
                     for (k, v) in kvs.kvs {
-                        let key = unwrap_or_return!(base64::decode(&k), {
-                            debug!("Error decoding proof key");
-                            false
-                        });
+                        let Ok(key) = base64::decode(&k) else {
+                            return Err("Error decoding proof key".into());
+                        };
                         if !_verify_proof(
                             proof_nodes.as_slice(),
                             root_hash.as_slice(),
                             &key,
                             v.as_deref(),
                         ) {
-                            debug!("Simple verification failed");
-                            return false;
+                            return Err("Simple verification failed".into());
                         }
                     }
                 }
@@ -346,8 +339,7 @@ pub(crate) fn verify_parsed_sp(
                         data.next,
                         &kvs.kvs,
                     ) {
-                        debug!("Range verification failed");
-                        return false;
+                        return Err("Range verification failed".into());
                     }
                 }
                 KeyValueSimpleDataVerificationType::MerkleTree(length) => {
@@ -357,22 +349,43 @@ pub(crate) fn verify_parsed_sp(
                         &kvs.kvs,
                         length,
                     ) {
-                        return false;
+                        return Err("Merkle tree verification failed".into());
                     }
                 }
             },
             //TODO IS-713 support KeyValuesInSP::SubTrie
             kvs => {
-                debug!(
-                    "Unsupported parsed state proof format for key-values {:?} ",
-                    kvs
-                );
-                return false;
+                return Err(format!(
+                    "Unsupported parsed state proof format for key-values: {kvs:?}"
+                ));
             }
         }
     }
 
-    true
+    if let Some(multi_sig) = multi_sig.as_ref() {
+        let Some((signature, participants, value)) =
+            _parse_reply_for_proof_signature_checking(multi_sig)
+        else {
+            return Err("State proof parsing of reply failed".into());
+        };
+        let verify_err = match _verify_proof_signature(
+            signature,
+            participants.as_slice(),
+            &value,
+            nodes,
+            f,
+            gen,
+        ) {
+            Ok(_) => None,
+            Err(err) => Some(format!("Proof signature verification failed: {}", err)),
+        };
+        let Ok(asserts) = serde_json::from_value(multi_sig["value"].clone()) else {
+            return Err("Error parsing state proof assertions".into());
+        };
+        Ok((asserts, verify_err))
+    } else {
+        Err("Proof signature verification failed: no parsed state proofs".into())
+    }
 }
 
 pub(crate) fn parse_key_from_request_for_builtin_sp(
@@ -395,7 +408,7 @@ pub(crate) fn parse_key_from_request_for_builtin_sp(
                 );
 
                 let marker = if is_node_1_3 { '\x01' } else { '1' };
-                let hash = SHA256::digest(attr_name.as_bytes());
+                let hash = Sha256::digest(attr_name.as_bytes());
                 format!(":{}:{}", marker, hex::encode(hash))
             } else {
                 trace!("parse_key_from_request_for_builtin_sp: <<< GET_ATTR No key suffix");
@@ -563,7 +576,7 @@ pub(crate) fn parse_key_from_request_for_builtin_sp(
     let key_prefix = match type_ {
         constants::GET_NYM => {
             if let Some(dest) = dest {
-                SHA256::digest(dest.as_bytes())
+                Sha256::digest(dest.as_bytes()).to_vec()
             } else {
                 debug!("parse_key_from_request_for_builtin_sp: <<< No dest");
                 return None;
@@ -732,7 +745,7 @@ fn _parse_reply_for_sp(
         let proof = if let Some(path) = parsed_data["auditPath"].as_array() {
             let path_str = json!(path).to_string();
             trace!("parse_reply_for_builtin_sp: proof: {:?}", path);
-            base64::encode(&path_str)
+            base64::encode(path_str)
         } else {
             return Err(input_err("No proof"));
         };
@@ -905,6 +918,25 @@ fn _verify_merkle_tree(
     kvs: &[(String, Option<String>)],
     length: u64,
 ) -> bool {
+    let (key, value) = &kvs[0];
+    let Some(value) = value.as_ref() else {
+        debug!("No value for merkle tree hash");
+        return false;
+    };
+    let seq_no = match base64::decode(key)
+        .map_err_string()
+        .and_then(|key| String::from_utf8(key).map_err_string())
+        .and_then(|key| key.parse::<u64>().map_err_string())
+    {
+        Ok(seq_no) => seq_no,
+        Err(err) => {
+            debug!("Error while parsing merkle tree seq_no: {}", err);
+            return false;
+        }
+    };
+
+    let turns = _calculate_turns(length, seq_no - 1);
+
     let nodes = match std::str::from_utf8(proof_nodes) {
         Ok(res) => res,
         Err(err) => {
@@ -922,22 +954,6 @@ fn _verify_merkle_tree(
 
     trace!("_verify_merkle_tree >> hashes: {:?}", hashes);
 
-    let (key, value) = &kvs[0];
-    if value.is_none() {
-        debug!("No value for merkle tree hash");
-        return false;
-    }
-    let seq_no = in_closure! {
-        let key = base64::decode(&key).map_err_string()?;
-        let key = std::str::from_utf8(&key).map_err_string()?;
-        key.parse::<u64>().map_err_string()
-    };
-    let seq_no = unwrap_or_map_return!(seq_no, |err| {
-        debug!("Error while parsing merkle tree seq_no: {}", err);
-        false
-    });
-
-    let turns = _calculate_turns(length, seq_no - 1);
     trace!(
         "_verify_merkle_tree >> seq_no: {}, turns: {:?}",
         seq_no,
@@ -949,49 +965,46 @@ fn _verify_merkle_tree(
         return false;
     }
 
-    let hashes_with_turns = hashes.iter().zip(turns).collect::<Vec<(&String, bool)>>();
-
-    let hash = in_closure! {
-        let val = value.as_ref().unwrap();
-        let val = serde_json::from_str::<serde_json::Value>(val).map_err_string()?;
-        let val = rmp_serde::to_vec(&val).map_err_string()?;
-        Sha256::hash_leaf(&val).map_err_string()
-    };
-    let mut hash = unwrap_or_map_return!(hash, |err| {
-        debug!("Error while hashing merkle tree leaf: {:?}", err);
-        false
-    });
-
-    trace!("Hashed leaf in b58: {}", base58::encode(&hash));
-
-    for (next_hash, turn_right) in hashes_with_turns {
-        let _next_hash = unwrap_or_return!(base58::decode(next_hash), {
-            debug!("Error decoding next hash as base58");
-            false
-        });
-        let turned_hash = if turn_right {
-            Sha256::hash_nodes(&hash, &_next_hash)
-        } else {
-            Sha256::hash_nodes(&_next_hash, &hash)
+    let mut path = Vec::with_capacity(hashes.len());
+    for (hash, t_right) in hashes.into_iter().zip(turns) {
+        let Ok(hash) = base58::decode(hash) else {
+            debug!("Error decoding hash as base58");
+            return false;
         };
-        hash = unwrap_or_map_return!(turned_hash, |err| {
-            debug!("Error while hashing: {:?}", err);
+        path.push(if t_right {
+            Positioned::Right(hash)
+        } else {
+            Positioned::Left(hash)
+        });
+    }
+
+    let leaf_value = match serde_json::from_str::<serde_json::Value>(value)
+        .map_err_string()
+        .and_then(|val| rmp_serde::to_vec(&val).map_err_string())
+    {
+        Ok(val) => val,
+        Err(err) => {
+            debug!("Error while decoding merkle tree leaf: {:?}", err);
+            return false;
+        }
+    };
+
+    trace!("Leaf value: {}", base58::encode(&leaf_value));
+
+    match MerkleTree::check_inclusion_proof(root_hash, &leaf_value, &path) {
+        Ok(true) => {
+            trace!("Matched root hash: {}", base58::encode(root_hash));
+            true
+        }
+        Ok(false) => {
+            debug!("Merkle tree hash mismatch");
             false
-        })
+        }
+        Err(err) => {
+            trace!("Error checking merkle tree root hash: {}", err);
+            false
+        }
     }
-
-    let result = hash.as_slice() == root_hash;
-    if !result {
-        debug!(
-            "Merkle tree hash mismatch: {} != {}",
-            base58::encode(hash),
-            base58::encode(root_hash)
-        );
-    } else {
-        trace!("Matched root hash: {}", base58::encode(root_hash))
-    }
-
-    result
 }
 
 // true is right
@@ -1067,6 +1080,7 @@ fn _verify_proof_range(
         };
         // Preparation of data for verification
         // Fetch numerical suffixes
+        #[allow(clippy::type_complexity)]
         let vals_for_sort_check: Vec<Option<(u64, (String, Option<String>))>> = vals.into_iter()
             .filter(|(key, _)| key.starts_with(prefix))
             .map(|(key, value)| {
@@ -1103,7 +1117,7 @@ fn _verify_proof_range(
         } else {
             vals_with_from.as_slice()
         };
-        let vals_prepared: Vec<(String, Option<String>)> = vals_slice.iter().map(|&(_, ref pair)| pair.clone()).collect();
+        let vals_prepared: Vec<(String, Option<String>)> = vals_slice.iter().map(|(_, ref pair)| pair.clone()).collect();
         vals_prepared[..] == kvs[..]
     }).unwrap_or(false)
 }
@@ -1115,14 +1129,14 @@ fn _verify_proof_signature(
     nodes: &VerifierKeys,
     f: usize,
     gen: &Generator,
-) -> VdrResult<bool> {
+) -> Result<(), String> {
     let mut ver_keys: Vec<&VerKey> = Vec::with_capacity(nodes.len());
 
     for name in participants {
         if let Some(blskey) = nodes.get(name) {
             ver_keys.push(&blskey.inner)
         } else {
-            return Err(input_err(format!("BLS key not found for node: {:?}", name)));
+            return Err(format!("BLS key not found for node: {:?}", name));
         }
     }
 
@@ -1132,25 +1146,23 @@ fn _verify_proof_signature(
     );
 
     if ver_keys.len() < (nodes.len() - f) {
-        return Ok(false);
+        return Err("Insufficient participants in multi signature".into());
     }
 
-    let signature = if let Ok(signature) = base58::decode(signature) {
+    let signature = if let Some(signature) = base58::decode(signature)
+        .ok()
+        .and_then(|sig| MultiSignature::from_bytes(sig.as_slice()).ok())
+    {
         signature
     } else {
-        return Ok(false);
+        return Err("Error decoding multi signature".into());
     };
 
-    let signature = if let Ok(signature) = MultiSignature::from_bytes(signature.as_slice()) {
-        signature
-    } else {
-        return Ok(false);
-    };
+    if !Bls::verify_multi_sig(&signature, value, ver_keys.as_slice(), gen).unwrap_or(false) {
+        return Err("Multi signature failed verification".into());
+    }
 
-    let res = Bls::verify_multi_sig(&signature, value, ver_keys.as_slice(), gen).unwrap_or(false);
-
-    trace!("verify_proof_signature: <<< res: {:?}", res);
-    Ok(res)
+    Ok(())
 }
 
 fn _parse_reply_for_proof_value(
@@ -1212,14 +1224,14 @@ fn _parse_reply_for_proof_value(
                             value["txn"]["data"]["raw"] = SJsonValue::from("");
                         } else {
                             value["txn"]["data"]["raw"] =
-                                SJsonValue::from(hex::encode(SHA256::digest(raw.as_bytes())));
+                                SJsonValue::from(hex::encode(Sha256::digest(raw.as_bytes())));
                         }
                     } else if let Some(enc) = value["txn"]["data"]["enc"].as_str() {
                         if enc.is_empty() {
                             value["txn"]["data"]["enc"] = SJsonValue::from("");
                         } else {
                             value["txn"]["data"]["enc"] =
-                                SJsonValue::from(hex::encode(SHA256::digest(enc.as_bytes())));
+                                SJsonValue::from(hex::encode(Sha256::digest(enc.as_bytes())));
                         }
                     }
                 }
@@ -1230,7 +1242,7 @@ fn _parse_reply_for_proof_value(
                 value["verkey"] = parsed_data["verkey"].clone();
             }
             constants::GET_ATTR => {
-                value["val"] = SJsonValue::String(hex::encode(SHA256::digest(data.as_bytes())));
+                value["val"] = SJsonValue::String(hex::encode(Sha256::digest(data.as_bytes())));
             }
             constants::GET_CRED_DEF
             | constants::GET_REVOC_REG_DEF
@@ -1297,7 +1309,7 @@ fn _parse_reply_for_proof_value(
 
 fn _calculate_taa_digest(text: &str, version: &str) -> VdrResult<Vec<u8>> {
     let content: String = version.to_string() + text;
-    Ok(SHA256::digest(content.as_bytes()))
+    Ok(Sha256::digest(content.as_bytes()).to_vec())
 }
 
 fn _is_full_taa_state_value_expected(expected_state_key: &[u8]) -> bool {
@@ -1310,6 +1322,8 @@ fn _if_rev_delta_multi_state_proof_expected(sp_key: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::{config::constants::DEFAULT_GENERATOR, pool::VerifierKey};
+
     use super::*;
 
     use hex::FromHex;
@@ -2008,7 +2022,7 @@ mod tests {
             }
         });
 
-        let nodes_str = base64::encode(&json!(["1", "2"]).to_string());
+        let nodes_str = base64::encode(json!(["1", "2"]).to_string());
 
         let mut parsed_sps =
             super::parse_generic_reply_for_proof_checking(json_msg, "", Some("2".as_bytes()), None)
@@ -2045,7 +2059,7 @@ mod tests {
                     }
                 });
 
-        let nodes_str = base64::encode(&json!(["1", "2"]).to_string());
+        let nodes_str = base64::encode(json!(["1", "2"]).to_string());
 
         let mut parsed_sps =
             super::parse_generic_reply_for_proof_checking(json_msg, "", Some("2".as_bytes()), None)
@@ -2108,7 +2122,7 @@ mod tests {
                     }
                 });
 
-        let nodes_str = base64::encode(&json!(["1", "2"]).to_string());
+        let nodes_str = base64::encode(json!(["1", "2"]).to_string());
 
         let mut parsed_sps =
             super::parse_generic_reply_for_proof_checking(json_msg, "", Some("2".as_bytes()), None)
@@ -2270,6 +2284,57 @@ mod tests {
                         }
                     ),
             })
+        );
+    }
+
+    #[test]
+    fn check_state_proof_valid() {
+        let raw_msg = r#"{"op":"REPLY","result":{"identifier":"LibindyDid111111111111","reqId":1691520834828315000,"type":"3","data":{"reqSignature":{},"txn":{"data":{"dest":"V4SGRU86Z58d6TV7PBUe6f","role":"0","verkey":"~CoRER63DVYnWZtK8uAzNbx"},"metadata":{},"type":"1"},"txnMetadata":{"seqNo":1},"ver":"1","rootHash":"DxX9E3XxEPHbb3JjakcmSduPc2bBcWsFhZZGp5aa842q","auditPath":["3XtSyZ8CQPJUYbc5mFKvUendLZSt4ybG2Y4zRtJEewSL","96irBGYpWrTvrVATexGGvktPrT3WicixwT8BtoZTtkYX","HqXD3TkLbpRuRU7CrrvrBeZwKuNFVCfta1ez7X7jGjtF","3fsGMWtrpYdNiLZKRKGmhGUJTUkdC2yn2yNd8MPGjwdq","BwS8ttPxJXQ4yn5RDy6spyxrFRZkukr9dbs9bjfskz1U","3wvhiYWLX3fRwGp1SoLeMQas6xtRHK8n7a3WqLPiwyMc","8oJHS289uuhcmgrvrzVtXvRGFfoXRnTWZnHQRYopDtUG","B5yx8ExTWjkgaDHuYWbosaoPhuq15uBx1jmp6npp6cKa","41vHGCg6qKUEtLAveyeWLMNdhZoH89Ym6xymFvSj64ER","APznt6o24yBWCNs5tVF4fC6h6rMz1Joj9BYWQuXJH1V5","3EByMrinqTxqaC7VEnQj4bKn29Gg357MoaTJxhZJvAbv","CV3xU14oTyGxemt6ZzLGhcBoTEcQ9MivEgo4fREPJbax","9MvXyCYNaPnTWV5ZW6E8hkPnjEurmTGmzTTUJJ9sGZ3L","8T7istFjSSxgYzZoxcJLtBm1hW48kTpGXBqbXMigopZ5"],"ledgerSize":12713},"state_proof":{"multi_signature":{"signature":"RRM4P551uBWUUZrz1AnspaL2n4ar65WBLn1ANS2XUPWir8bEq5LWdowmdjYvp3scEHPEMxGgJTB5ffVevBsoMVgtyB2SUxr6ZTAAtmE73RETGVwRCQnz3k2gEGaYyAxVSon51RHW5Jg9hEgyMWR2j3aib5o7fFDZFhBy2oB1bS46go","participants":["Node3","Node2","Node1"],"value":{"ledger_id":1,"pool_state_root_hash":"7siDH8Qanh82UviK4zjBSfLXcoCvLaeGkrByi1ow9Tsm","state_root_hash":"8AasPY2KBtPLiVnvePAZhPZKAfRozAR9CBUYAXFBhdXo","timestamp":1691520806,"txn_root_hash":"DxX9E3XxEPHbb3JjakcmSduPc2bBcWsFhZZGp5aa842q"}}},"seqNo":1}}"#;
+        let f = 1;
+        let mut bls_keys = HashMap::new();
+        bls_keys.insert("Node1".to_owned(), VerifierKey::from_bytes(&hex::decode("20e085f100560896f50ea75e681a780275e9e39d645fcf8a48bc771dd41e304d099f5a5c009f5ac95776c7534ac4ec2550a0fa0da8422aa4b28a5ab76b34ba16054995a826fceef2fc619732c6971e5ca39a49f41b117e33868551c8f3f481751e34851a6c913a6f4e8c1d5ae13ac5460b69378b7d94a07f46fa92445dc8eecd").unwrap()).unwrap());
+        bls_keys.insert("Node2".to_owned(), VerifierKey::from_bytes(&hex::decode("14b2c1cb385e56510cc8f050317580bcaf792ba555f29f7a8454d4367d63ea8020e9a34506a173320a5d0a4dff36cdda7d1d7848495e8e0c2a420d55c5704efc0dd8cec3869e061728abc55ce9948085358c1661799a2e289ea2fda0d8d083640ade487d5787924a6ed0cd7cbe727b9296ea66e8acc7b47fa9e1254ac6ee2827").unwrap()).unwrap());
+        bls_keys.insert("Node3".to_owned(), VerifierKey::from_bytes(&hex::decode("187945bb8673691a57fa719dbc93653c909f359da42281b22b2b2e2748abc4d71ff796348e496d6be919bc3710f1b11d04fe9c436fb3c80ac5da556e94a73ba617d9180856dd73c6c30b9716ec0546ccebda8a80cd9058c88af45079a45ad35921cb2e6488caab9c4f35dbef9efdc22ece8769c60f82b38c78d547f7ad866016").unwrap()).unwrap());
+        bls_keys.insert("Node4".to_owned(), VerifierKey::from_bytes(&hex::decode("136feaf1ad5b81d70de5c5287b0ef24746b8db60dba8ec502aeb213ae5c9f1900b59ff8e6f38e00e5d4cf2a45fb3317a0ccfc710806d368acb2267e097ed696611cc9295d2bbca32d1e176f026a66f02f70a8851ec71f2f4321dc62f00b5cf071f32e6fc3a1f63278360c7dd8285224ed482ff59ab5063aee3117a111fc9ffd2").unwrap()).unwrap());
+        let reply: serde_json::Value = serde_json::from_str(raw_msg).unwrap();
+        let msg_result = &reply["result"];
+        let asserts = StateProofAssertions {
+            ledger_id: 1,
+            pool_state_root_hash: "7siDH8Qanh82UviK4zjBSfLXcoCvLaeGkrByi1ow9Tsm".into(),
+            state_root_hash: "8AasPY2KBtPLiVnvePAZhPZKAfRozAR9CBUYAXFBhdXo".into(),
+            timestamp: 1691520806,
+            txn_root_hash: "DxX9E3XxEPHbb3JjakcmSduPc2bBcWsFhZZGp5aa842q".into(),
+        };
+        assert_eq!(
+            check_state_proof(
+                msg_result,
+                f,
+                &DEFAULT_GENERATOR,
+                &bls_keys,
+                raw_msg,
+                Some(&[49]),
+                (None, Some(0)),
+                1691520806,
+                300,
+                None,
+            ),
+            StateProofResult::Verified(asserts.clone())
+        );
+
+        assert_eq!(
+            check_state_proof(
+                msg_result,
+                f,
+                &DEFAULT_GENERATOR,
+                &bls_keys,
+                raw_msg,
+                Some(&[49]),
+                (None, Some(1691521806)),
+                1691520806,
+                300,
+                None,
+            ),
+            StateProofResult::Expired(asserts)
         );
     }
 }
